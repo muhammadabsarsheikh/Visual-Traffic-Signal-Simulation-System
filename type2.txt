@@ -1,0 +1,654 @@
+#include <SFML/Graphics.hpp>
+#include <vector>
+#include <cstdlib>
+#include <ctime>
+#include <sstream>
+#include <iomanip>
+#include <memory>
+#include <iostream>
+#include <string>
+#include <optional>
+
+// ==========================================
+// Domain Classes (Simulation Logic)
+// ==========================================
+
+class Vehicle {
+public:
+    int id;
+    int arrivalTime;
+    bool priority;
+    Vehicle(int _id, int _arrivalTime, bool _priority = false)
+        : id(_id), arrivalTime(_arrivalTime), priority(_priority) {}
+};
+
+class Node {
+public:
+    Vehicle* v;
+    Node* next;
+    Node(Vehicle* _v) : v(_v), next(nullptr) {}
+};
+
+class Queue {
+private:
+    Node* frontPtr;
+    Node* rearPtr;
+    int sz;
+public:
+    Queue() : frontPtr(nullptr), rearPtr(nullptr), sz(0) {}
+    ~Queue() {
+        while (!isEmpty()) {
+            Vehicle* vv = dequeue();
+            delete vv;
+        }
+    }
+    bool isEmpty() const { return frontPtr == nullptr; }
+    void enqueue(Vehicle* vehicle) {
+        Node* temp = new Node(vehicle);
+        if (vehicle->priority) {
+            if (isEmpty()) {
+                frontPtr = rearPtr = temp;
+            } else {
+                temp->next = frontPtr;
+                frontPtr = temp;
+            }
+        } else {
+            if (rearPtr == nullptr) {
+                frontPtr = rearPtr = temp;
+            } else {
+                rearPtr->next = temp;
+                rearPtr = temp;
+            }
+        }
+        sz++;
+    }
+    Vehicle* dequeue() {
+        if (isEmpty()) return nullptr;
+        Node* tmp = frontPtr;
+        Vehicle* ret = tmp->v;
+        frontPtr = frontPtr->next;
+        if (frontPtr == nullptr) rearPtr = nullptr;
+        delete tmp;
+        sz--;
+        return ret;
+    }
+    Vehicle* peek() const {
+        if (isEmpty()) return nullptr;
+        return frontPtr->v;
+    }
+    int size() const { return sz; }
+    
+    std::vector<Vehicle*> getAllVehicles() const {
+        std::vector<Vehicle*> result;
+        Node* current = frontPtr;
+        while (current != nullptr) {
+            result.push_back(current->v);
+            current = current->next;
+        }
+        return result;
+    }
+};
+
+class TrafficLight {
+public:
+    int currentLane;
+    int greenTime;
+    int timer;
+    TrafficLight(int gtime = 5) : currentLane(0), greenTime(gtime), timer(0) {}
+    void nextSignal(int totalLanes) {
+        currentLane = (currentLane + 1) % totalLanes;
+        timer = 0;
+    }
+    void tick() { timer++; }
+    bool greenExpired() const { return timer >= greenTime; }
+};
+
+// ==========================================
+// GUI & Application Logic
+// ==========================================
+
+// Helper struct for the Input Form
+struct InputBox {
+    sf::RectangleShape rect;
+    sf::Text labelText;
+    sf::Text inputText;
+    std::string value;
+    bool isSelected = false;
+
+    // SFML 3.0 Fix: Constructor must initialize sf::Text with a font immediately
+    InputBox(float x, float y, const std::string& label, const std::string& defaultVal, const sf::Font& font) 
+        : labelText(font), inputText(font), value(defaultVal)
+    {
+        // Label Setup
+        labelText.setString(label);
+        labelText.setCharacterSize(18);
+        labelText.setFillColor(sf::Color::White);
+        labelText.setPosition({x, y});
+
+        // Box Setup
+        rect.setSize({200.f, 30.f});
+        rect.setPosition({x + 250.f, y});
+        rect.setFillColor(sf::Color(70, 70, 70));
+        rect.setOutlineThickness(2);
+        rect.setOutlineColor(sf::Color(150, 150, 150));
+
+        // Input Text Setup
+        inputText.setString(value);
+        inputText.setCharacterSize(18);
+        inputText.setFillColor(sf::Color::White);
+        inputText.setPosition({x + 255.f, y + 4.f});
+    }
+
+    void updateVisuals() {
+        if (isSelected) {
+            rect.setOutlineColor(sf::Color::Cyan);
+            rect.setFillColor(sf::Color(90, 90, 90));
+        } else {
+            rect.setOutlineColor(sf::Color(150, 150, 150));
+            rect.setFillColor(sf::Color(70, 70, 70));
+        }
+        inputText.setString(value);
+    }
+
+    void handleInput(uint32_t unicode) {
+        if (!isSelected) return;
+
+        // Backspace (8)
+        if (unicode == 8) {
+            if (!value.empty()) value.pop_back();
+        }
+        // Allow digits and dots for floats
+        else if ((unicode >= '0' && unicode <= '9') || unicode == '.') {
+            // Simple validation to prevent multiple dots
+            if (unicode == '.' && value.find('.') != std::string::npos) return;
+            // Prevent overly long inputs
+            if (value.length() < 10) {
+                value += static_cast<char>(unicode);
+            }
+        }
+    }
+};
+
+class TrafficApp {
+    enum State { SPLASH, INPUT, SIMULATION };
+
+private:
+    sf::RenderWindow window;
+    sf::Font font;
+    State currentState;
+
+    // --- Splash Screen Variables ---
+    sf::Clock splashClock;
+    float splashDuration = 2.0f; // Seconds
+
+    // --- Input Screen Variables ---
+    std::vector<InputBox> inputs;
+    int selectedInputIndex = 0;
+    
+    // --- Simulation Configuration ---
+    int lanes;
+    int simTime;
+    int greenTime;
+    double arrivalProb;
+    double priorityProb;
+    float stepDelay;
+
+    // --- Simulation Runtime Variables ---
+    int currentTime;
+    std::vector<Queue> roads;
+    TrafficLight light;
+    int vehicleIDCounter;
+    int totalArrived;
+    int totalPassed;
+    long long totalWaitTime;
+    
+    bool isPaused;
+    bool isRunning;
+    sf::Clock stepClock;
+
+public:
+    TrafficApp() 
+        : currentState(SPLASH), currentTime(0), vehicleIDCounter(1),
+          totalArrived(0), totalPassed(0), totalWaitTime(0),
+          isPaused(false), isRunning(true)
+    {
+        // SFML 3.0 Window Creation
+        window.create(sf::VideoMode({1200, 800}), "Traffic Signal Simulation System");
+        window.setFramerateLimit(60);
+
+        // Load font FIRST, before setting up inputs that use it
+        loadFont();
+        setupInputs();
+    }
+
+    void run() {
+        while (window.isOpen()) {
+            handleEvents();
+
+            switch (currentState) {
+                case SPLASH:
+                    updateSplash();
+                    renderSplash();
+                    break;
+                case INPUT:
+                    renderInput();
+                    break;
+                case SIMULATION:
+                    updateSimulation();
+                    renderSimulation();
+                    break;
+            }
+        }
+    }
+
+private:
+    void loadFont() {
+        // Try multiple paths for robustness
+        std::vector<std::string> fontPaths = {
+            "fonts/calibri-regular.ttf",
+            "calibri-regular.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        };
+
+        bool loaded = false;
+        for (const auto& path : fontPaths) {
+            if (font.openFromFile(path)) {
+                loaded = true;
+                break;
+            }
+        }
+        if (!loaded) {
+            std::cerr << "Error: Could not load any font!" << std::endl;
+        }
+    }
+
+    void setupInputs() {
+        // SFML 3.0 Fix: Use emplace_back to construct inputs with the font directly
+        // This avoids needing a default constructor (which we can't have with sf::Text)
+        inputs.reserve(6);
+        float startX = 350.f;
+        float startY = 200.f;
+        float gap = 60.f;
+
+        inputs.emplace_back(startX, startY + 0*gap, "Number of Lanes (int)", "4", font);
+        inputs.emplace_back(startX, startY + 1*gap, "Sim Time Steps (int)", "120", font);
+        inputs.emplace_back(startX, startY + 2*gap, "Green Time (steps)", "10", font);
+        inputs.emplace_back(startX, startY + 3*gap, "Arrival Prob (0.0-1.0)", "0.4", font);
+        inputs.emplace_back(startX, startY + 4*gap, "Priority Prob (0.0-1.0)", "0.05", font);
+        inputs.emplace_back(startX, startY + 5*gap, "Step Delay (seconds)", "0.2", font);
+        
+        inputs[0].isSelected = true; // Select first box by default
+        selectedInputIndex = 0;
+    }
+
+    void handleEvents() {
+        while (const std::optional<sf::Event> event = window.pollEvent()) {
+            if (event->is<sf::Event::Closed>()) {
+                window.close();
+            }
+
+            // Global Key Handler
+            if (const auto* keyPress = event->getIf<sf::Event::KeyPressed>()) {
+                if (keyPress->code == sf::Keyboard::Key::Escape) {
+                    window.close();
+                }
+            }
+
+            // Input State Specific Handling
+            if (currentState == INPUT) {
+                if (const auto* keyPress = event->getIf<sf::Event::KeyPressed>()) {
+                    if (keyPress->code == sf::Keyboard::Key::Enter) {
+                        startSimulation();
+                    }
+                    else if (keyPress->code == sf::Keyboard::Key::Tab) {
+                        // Cycle selection
+                        inputs[selectedInputIndex].isSelected = false;
+                        selectedInputIndex = (selectedInputIndex + 1) % inputs.size();
+                        inputs[selectedInputIndex].isSelected = true;
+                    }
+                    else if (keyPress->code == sf::Keyboard::Key::Down) {
+                         inputs[selectedInputIndex].isSelected = false;
+                         selectedInputIndex = (selectedInputIndex + 1) % inputs.size();
+                         inputs[selectedInputIndex].isSelected = true;
+                    }
+                    else if (keyPress->code == sf::Keyboard::Key::Up) {
+                         inputs[selectedInputIndex].isSelected = false;
+                         selectedInputIndex = (selectedInputIndex - 1 + inputs.size()) % inputs.size();
+                         inputs[selectedInputIndex].isSelected = true;
+                    }
+                }
+                
+                if (const auto* textEvent = event->getIf<sf::Event::TextEntered>()) {
+                    inputs[selectedInputIndex].handleInput(textEvent->unicode);
+                }
+            }
+            // Simulation State Specific Handling
+            else if (currentState == SIMULATION) {
+                if (const auto* keyPress = event->getIf<sf::Event::KeyPressed>()) {
+                    if (keyPress->code == sf::Keyboard::Key::Space) {
+                        isPaused = !isPaused;
+                    }
+                    else if (keyPress->code == sf::Keyboard::Key::R) {
+                        resetSimulation();
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Splash Screen Logic ---
+    void updateSplash() {
+        if (splashClock.getElapsedTime().asSeconds() > splashDuration) {
+            currentState = INPUT;
+        }
+    }
+
+    void renderSplash() {
+        window.clear(sf::Color(20, 20, 30));
+
+        sf::Text title(font);
+        title.setString("Traffic Signal Simulation");
+        title.setCharacterSize(60);
+        title.setFillColor(sf::Color::Cyan);
+        
+        // Center text
+        sf::FloatRect textRect = title.getLocalBounds();
+        title.setOrigin({textRect.position.x + textRect.size.x/2.0f,
+                         textRect.position.y + textRect.size.y/2.0f});
+        title.setPosition({window.getSize().x/2.0f, window.getSize().y/2.0f - 20});
+
+        sf::Text sub(font);
+        sub.setString("Loading System...");
+        sub.setCharacterSize(24);
+        sub.setFillColor(sf::Color(150, 150, 150));
+        sf::FloatRect subRect = sub.getLocalBounds();
+        sub.setOrigin({subRect.position.x + subRect.size.x/2.0f, subRect.position.y});
+        sub.setPosition({window.getSize().x/2.0f, window.getSize().y/2.0f + 50});
+
+        window.draw(title);
+        window.draw(sub);
+        window.display();
+    }
+
+    // --- Input Screen Logic ---
+    void renderInput() {
+        window.clear(sf::Color(30, 30, 30));
+
+        sf::Text header(font);
+        header.setString("Configuration Parameters");
+        header.setCharacterSize(36);
+        header.setFillColor(sf::Color::White);
+        header.setPosition({350.f, 100.f});
+        window.draw(header);
+
+        for (auto& box : inputs) {
+            box.updateVisuals();
+            window.draw(box.labelText);
+            window.draw(box.rect);
+            window.draw(box.inputText);
+        }
+
+        sf::Text instr(font);
+        instr.setString("Press TAB to switch fields. Press ENTER to start.");
+        instr.setCharacterSize(20);
+        instr.setFillColor(sf::Color::Yellow);
+        instr.setPosition({350.f, 600.f});
+        window.draw(instr);
+
+        window.display();
+    }
+
+    void startSimulation() {
+        try {
+            // Parse inputs
+            lanes = std::stoi(inputs[0].value);
+            simTime = std::stoi(inputs[1].value);
+            greenTime = std::stoi(inputs[2].value);
+            arrivalProb = std::stod(inputs[3].value);
+            priorityProb = std::stod(inputs[4].value);
+            stepDelay = std::stof(inputs[5].value);
+
+            // Validation
+            if (lanes < 1) lanes = 1;
+            if (lanes > 8) lanes = 8; // Cap for rendering safety
+            
+            // Initialize Simulation Objects
+            resetSimulation();
+            currentState = SIMULATION;
+        } catch (...) {
+            std::cerr << "Invalid input format" << std::endl;
+        }
+    }
+
+    // --- Simulation Logic ---
+    void resetSimulation() {
+        currentTime = 0;
+        vehicleIDCounter = 1;
+        totalArrived = 0;
+        totalPassed = 0;
+        totalWaitTime = 0;
+        light = TrafficLight(greenTime);
+        roads.clear();
+        roads.resize(lanes);
+        isPaused = false;
+        isRunning = true;
+        stepClock.restart();
+    }
+
+    void updateSimulation() {
+        if (!isRunning || isPaused) return;
+
+        if (currentTime >= simTime) {
+            isRunning = false;
+            return;
+        }
+
+        if (stepClock.getElapsedTime().asSeconds() >= stepDelay) {
+            // 1. Generate Arrivals
+            for (int i = 0; i < lanes; ++i) {
+                double r = (double)rand() / RAND_MAX;
+                if (r < arrivalProb) {
+                    double p = (double)rand() / RAND_MAX;
+                    bool isPriority = (p < priorityProb);
+                    Vehicle* v = new Vehicle(vehicleIDCounter++, currentTime, isPriority);
+                    roads[i].enqueue(v);
+                    totalArrived++;
+                }
+            }
+
+            // 2. Process Green Lane
+            int lane = light.currentLane;
+            Vehicle* v = roads[lane].dequeue();
+            if (v != nullptr) {
+                int wait = currentTime - v->arrivalTime;
+                totalPassed++;
+                totalWaitTime += wait;
+                delete v;
+            }
+
+            // 3. Update Light
+            light.tick();
+            if (light.greenExpired()) {
+                light.nextSignal(lanes);
+            }
+
+            currentTime++;
+            stepClock.restart();
+        }
+    }
+
+void renderSimulation() {
+        window.clear(sf::Color(40, 40, 40));
+        
+        // --- 1. Draw Time Step Display (Red Rectangle) ---
+        sf::RectangleShape timeRect({200.f, 50.f});
+        timeRect.setFillColor(sf::Color::Red);
+        timeRect.setOutlineThickness(2);
+        timeRect.setOutlineColor(sf::Color::White);
+        // Center the box at the top
+        timeRect.setPosition({window.getSize().x / 2.0f - 100.0f, 20.0f});
+        window.draw(timeRect);
+
+        sf::Text timeText(font);
+        timeText.setString("Time Step: " + std::to_string(currentTime));
+        timeText.setCharacterSize(24);
+        timeText.setFillColor(sf::Color::White);
+        // Center text inside the box
+        sf::FloatRect textBounds = timeText.getLocalBounds();
+        timeText.setOrigin({textBounds.position.x + textBounds.size.x / 2.0f,
+                            textBounds.position.y + textBounds.size.y / 2.0f});
+        timeText.setPosition({window.getSize().x / 2.0f, 45.0f});
+        window.draw(timeText);
+
+
+        // --- 2. Draw Lanes and Vehicles ---
+        float laneWidth = 800.0f;
+        float laneHeight = 600.0f / lanes;
+        float startX = 50.0f;
+        float startY = 150.0f;
+
+        for (int i = 0; i < lanes; ++i) {
+            float y = startY + i * laneHeight;
+            
+            // Draw Road Surface
+            sf::RectangleShape laneRect({laneWidth, laneHeight - 10});
+            laneRect.setPosition({startX, y});
+            laneRect.setFillColor(sf::Color(50, 50, 50)); 
+            laneRect.setOutlineThickness(2);
+            laneRect.setOutlineColor(sf::Color(100, 100, 100));
+            window.draw(laneRect);
+
+            // Draw Center Dashed Line
+            sf::RectangleShape dash({20.f, 2.f});
+            dash.setFillColor(sf::Color(150, 150, 150));
+            for(float d = 0; d < laneWidth; d += 50) {
+                dash.setPosition({startX + d, y + (laneHeight / 2) - 5});
+                window.draw(dash);
+            }
+
+            // Draw Stop Line (At the Right End)
+            float stopLineX = startX + laneWidth - 20.0f;
+            sf::RectangleShape stopLine({5.f, laneHeight - 10});
+            stopLine.setPosition({stopLineX, y});
+            stopLine.setFillColor(sf::Color::White);
+            window.draw(stopLine);
+
+            // Draw Traffic Light
+            sf::CircleShape lightCircle(15);
+            lightCircle.setPosition({stopLineX + 20, y + laneHeight/2 - 15});
+            if (light.currentLane == i) {
+                lightCircle.setFillColor(sf::Color::Green);
+            } else {
+                lightCircle.setFillColor(sf::Color::Red);
+            }
+            window.draw(lightCircle);
+
+            // Draw Vehicles (Right-Aligned Queue)
+            // The front of the queue (index 0) is drawn at the Stop Line.
+            // Subsequent vehicles are drawn to the left.
+            auto vehicles = roads[i].getAllVehicles();
+            float vehicleLength = 40.0f; // Longer car for better visibility
+            float gap = 10.0f;           // Gap between cars
+            
+            for (size_t j = 0; j < vehicles.size(); ++j) {
+                // Calculate X position:
+                // Start at StopLine -> Shift Left by CarLength -> Shift Left for every car ahead in queue
+                float carX = stopLineX - vehicleLength - (j * (vehicleLength + gap));
+
+                // Only draw if the car is still on the screen (entering from left)
+                if (carX > startX - vehicleLength) {
+                    sf::RectangleShape vehicleRect({vehicleLength, laneHeight - 30});
+                    
+                    // Clamp position if it's just entering the screen
+                    float drawX = std::max(carX, startX);
+                    // Adjust width if partially off-screen
+                    float drawWidth = (carX < startX) ? (vehicleLength - (startX - carX)) : vehicleLength;
+
+                    vehicleRect.setSize({drawWidth, laneHeight - 30});
+                    vehicleRect.setPosition({drawX, y + 10});
+                    
+                    if (vehicles[j]->priority) {
+                        vehicleRect.setFillColor(sf::Color(255, 215, 0)); // Gold
+                    } else {
+                        // Varied Blue colors
+                        vehicleRect.setFillColor(sf::Color(100, 149, 237)); 
+                    }
+                    vehicleRect.setOutlineThickness(1);
+                    vehicleRect.setOutlineColor(sf::Color::Black);
+                    
+                    window.draw(vehicleRect);
+
+                    // Direction Arrow (Headlight pointing right)
+                    if (drawWidth > 10) {
+                        sf::RectangleShape headlight({4.f, laneHeight - 34});
+                        headlight.setFillColor(sf::Color(255, 255, 200, 150));
+                        headlight.setPosition({drawX + drawWidth - 6, y + 12});
+                        window.draw(headlight);
+                    }
+                }
+            }
+
+            // Lane Number Label
+            sf::Text laneLabel(font);
+            laneLabel.setString("Lane " + std::to_string(i));
+            laneLabel.setCharacterSize(16);
+            laneLabel.setFillColor(sf::Color::White);
+            laneLabel.setPosition({startX + 10, y + 5});
+            window.draw(laneLabel);
+        }
+
+        drawSimStats();
+        window.display();
+    }
+    
+    void drawSimStats() {
+        float panelX = 900.0f;
+        float panelY = 150.0f;
+
+        sf::RectangleShape panel({280, 400});
+        panel.setPosition({panelX, panelY});
+        panel.setFillColor(sf::Color(50, 50, 50));
+        panel.setOutlineThickness(2);
+        panel.setOutlineColor(sf::Color(100, 100, 100));
+        window.draw(panel);
+
+        std::vector<std::string> lines;
+        lines.push_back("SIMULATION RUNNING");
+        lines.push_back("Time: " + std::to_string(currentTime) + " / " + std::to_string(simTime));
+        lines.push_back("Green Lane: " + std::to_string(light.currentLane));
+        lines.push_back("Arrived: " + std::to_string(totalArrived));
+        lines.push_back("Passed: " + std::to_string(totalPassed));
+        
+        double avgWait = (totalPassed == 0) ? 0.0 : (double)totalWaitTime / totalPassed;
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << avgWait;
+        lines.push_back("Avg Wait: " + oss.str());
+
+        float textY = panelY + 20;
+        for (const auto& line : lines) {
+            sf::Text txt(font);
+            txt.setString(line);
+            txt.setCharacterSize(16);
+            txt.setFillColor(sf::Color::White);
+            txt.setPosition({panelX + 15, textY});
+            window.draw(txt);
+            textY += 25;
+        }
+
+        // Controls info
+        sf::Text controls(font);
+        controls.setString("SPACE: Pause | R: Reset | ESC: Exit");
+        controls.setCharacterSize(14);
+        controls.setFillColor(sf::Color(200, 200, 200));
+        controls.setPosition({350, 60});
+        window.draw(controls);
+    }
+};
+
+int main() {
+    srand((unsigned)time(nullptr));
+    TrafficApp app;
+    app.run();
+    return 0;
+}

@@ -1,0 +1,457 @@
+#include <SFML/Graphics.hpp>
+#include <vector>
+#include <cstdlib>
+#include <ctime>
+#include <sstream>
+#include <iomanip>
+#include <memory>
+#include <iostream>
+
+class Vehicle {
+public:
+    int id;
+    int arrivalTime;
+    bool priority;
+    Vehicle(int _id, int _arrivalTime, bool _priority = false)
+        : id(_id), arrivalTime(_arrivalTime), priority(_priority) {}
+};
+
+class Node {
+public:
+    Vehicle* v;
+    Node* next;
+    Node(Vehicle* _v) : v(_v), next(nullptr) {}
+};
+
+class Queue {
+private:
+    Node* frontPtr;
+    Node* rearPtr;
+    int sz;
+public:
+    Queue() : frontPtr(nullptr), rearPtr(nullptr), sz(0) {}
+    ~Queue() {
+        while (!isEmpty()) {
+            Vehicle* vv = dequeue();
+            delete vv;
+        }
+    }
+    bool isEmpty() const { return frontPtr == nullptr; }
+    void enqueue(Vehicle* vehicle) {
+        Node* temp = new Node(vehicle);
+        if (vehicle->priority) {
+            if (isEmpty()) {
+                frontPtr = rearPtr = temp;
+            } else {
+                temp->next = frontPtr;
+                frontPtr = temp;
+            }
+        } else {
+            if (rearPtr == nullptr) {
+                frontPtr = rearPtr = temp;
+            } else {
+                rearPtr->next = temp;
+                rearPtr = temp;
+            }
+        }
+        sz++;
+    }
+    Vehicle* dequeue() {
+        if (isEmpty()) return nullptr;
+        Node* tmp = frontPtr;
+        Vehicle* ret = tmp->v;
+        frontPtr = frontPtr->next;
+        if (frontPtr == nullptr) rearPtr = nullptr;
+        delete tmp;
+        sz--;
+        return ret;
+    }
+    Vehicle* peek() const {
+        if (isEmpty()) return nullptr;
+        return frontPtr->v;
+    }
+    int size() const { return sz; }
+    
+    // Helper to get all vehicles for rendering
+    std::vector<Vehicle*> getAllVehicles() const {
+        std::vector<Vehicle*> result;
+        Node* current = frontPtr;
+        while (current != nullptr) {
+            result.push_back(current->v);
+            current = current->next;
+        }
+        return result;
+    }
+};
+
+class TrafficLight {
+public:
+    int currentLane;
+    int greenTime;
+    int timer;
+    TrafficLight(int gtime = 5) : currentLane(0), greenTime(gtime), timer(0) {}
+    void nextSignal(int totalLanes) {
+        currentLane = (currentLane + 1) % totalLanes;
+        timer = 0;
+    }
+    void tick() { timer++; }
+    bool greenExpired() const { return timer >= greenTime; }
+};
+
+class SimulationGUI {
+private:
+    int lanes;
+    int simTime;
+    int currentTime;
+    std::vector<Queue> roads;
+    TrafficLight light;
+    int vehicleIDCounter;
+    int totalArrived;
+    int totalPassed;
+    long long totalWaitTime;
+    double arrivalProb;
+    double priorityProb;
+    
+    sf::RenderWindow window;
+    sf::Font font;
+    bool isPaused;
+    bool isRunning;
+    sf::Clock stepClock;
+    float stepDelay; // seconds per step
+    
+public:
+    SimulationGUI(int _lanes = 4, int _simTime = 60, int _greenTime = 5,
+                  double _arrivalProb = 0.5, double _priorityProb = 0.01,
+                  float _stepDelay = 0.5f)
+        : lanes(_lanes), simTime(_simTime), currentTime(0),
+          roads(_lanes), light(_greenTime), vehicleIDCounter(1), totalArrived(0),
+          totalPassed(0), totalWaitTime(0), arrivalProb(_arrivalProb), 
+          priorityProb(_priorityProb), isPaused(false), isRunning(true),
+          stepDelay(_stepDelay)
+    {
+        // SFML 3.0 syntax for VideoMode
+        window.create(sf::VideoMode(sf::Vector2u(1200, 800)), "Traffic Signal Simulation");
+        window.setFramerateLimit(60);
+        
+        // SFML 3.0 syntax - openFromFile instead of loadFromFile
+        if (!font.openFromFile("fonts/calibri-regular.ttf")) {
+            if (!font.openFromFile("calibri-regular.ttf")) {
+                if (!font.openFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")) {
+                    if (!font.openFromFile("C:\\Windows\\Fonts\\arial.ttf")) {
+                        std::cerr << "Warning: Could not load font. Text will not display." << std::endl;
+                    }
+                }
+            }
+        }
+        
+        srand((unsigned)time(nullptr));
+    }
+    
+    void run() {
+        while (window.isOpen()) {
+            handleEvents();
+            
+            if (isRunning && !isPaused && stepClock.getElapsedTime().asSeconds() >= stepDelay) {
+                update();
+                stepClock.restart();
+            }
+            
+            render();
+        }
+    }
+    
+private:
+    void handleEvents() {
+        // SFML 3.0 event handling
+        while (std::optional<sf::Event> event = window.pollEvent()) {
+            if (event->is<sf::Event::Closed>()) {
+                window.close();
+            }
+            else if (const auto* keyPress = event->getIf<sf::Event::KeyPressed>()) {
+                // SFML 3.0 - Keyboard::Key::Space instead of Keyboard::Space
+                if (keyPress->code == sf::Keyboard::Key::Space) {
+                    isPaused = !isPaused;
+                }
+                else if (keyPress->code == sf::Keyboard::Key::R) {
+                    reset();
+                }
+                else if (keyPress->code == sf::Keyboard::Key::Escape) {
+                    window.close();
+                }
+            }
+        }
+    }
+    
+    void update() {
+        if (currentTime >= simTime) {
+            isRunning = false;
+            return;
+        }
+        
+        handleArrivals();
+        processGreenLane();
+        light.tick();
+        
+        if (light.greenExpired()) {
+            light.nextSignal(lanes);
+        }
+        
+        currentTime++;
+    }
+    
+    void handleArrivals() {
+        for (int i = 0; i < lanes; ++i) {
+            double r = (double)rand() / RAND_MAX;
+            if (r < arrivalProb) {
+                double p = (double)rand() / RAND_MAX;
+                bool isPriority = (p < priorityProb);
+                Vehicle* v = new Vehicle(vehicleIDCounter++, currentTime, isPriority);
+                roads[i].enqueue(v);
+                totalArrived++;
+            }
+        }
+    }
+    
+    void processGreenLane() {
+        int lane = light.currentLane;
+        Vehicle* v = roads[lane].dequeue();
+        if (v != nullptr) {
+            int wait = currentTime - v->arrivalTime;
+            totalPassed++;
+            totalWaitTime += wait;
+            delete v;
+        }
+    }
+    
+    void reset() {
+        currentTime = 0;
+        vehicleIDCounter = 1;
+        totalArrived = 0;
+        totalPassed = 0;
+        totalWaitTime = 0;
+        light = TrafficLight(light.greenTime);
+        roads.clear();
+        roads.resize(lanes);
+        isPaused = false;
+        isRunning = true;
+        stepClock.restart();
+    }
+    
+    void render() {
+        window.clear(sf::Color(40, 40, 40));
+        
+        // Draw lanes
+        float laneWidth = 800.0f;
+        float laneHeight = 600.0f / lanes;
+        float startX = 50.0f;
+        float startY = 150.0f;
+        
+        for (int i = 0; i < lanes; ++i) {
+            float y = startY + i * laneHeight;
+            
+            // Lane background
+            sf::RectangleShape laneRect(sf::Vector2f(laneWidth, laneHeight - 10));
+            laneRect.setPosition(sf::Vector2f(startX, y));
+            laneRect.setFillColor(sf::Color(60, 60, 60));
+            laneRect.setOutlineThickness(2);
+            laneRect.setOutlineColor(sf::Color(100, 100, 100));
+            window.draw(laneRect);
+            
+            // Traffic light for this lane
+            sf::CircleShape lightCircle(15);
+            lightCircle.setPosition(sf::Vector2f(startX + laneWidth + 20, y + laneHeight/2 - 15));
+            if (light.currentLane == i) {
+                lightCircle.setFillColor(sf::Color(0, 255, 0)); // Green
+            } else {
+                lightCircle.setFillColor(sf::Color(255, 0, 0)); // Red
+            }
+            window.draw(lightCircle);
+            
+            // Lane label - SFML 3.0 requires Text(font)
+            sf::Text laneLabel(font);
+            laneLabel.setString("Lane " + std::to_string(i));
+            laneLabel.setCharacterSize(16);
+            laneLabel.setFillColor(sf::Color::White);
+            laneLabel.setPosition(sf::Vector2f(10, y + laneHeight/2 - 10));
+            window.draw(laneLabel);
+            
+            // Draw vehicles in queue
+            auto vehicles = roads[i].getAllVehicles();
+            float vehicleSpacing = 35.0f;
+            for (size_t j = 0; j < vehicles.size() && j < 20; ++j) {
+                sf::RectangleShape vehicleRect(sf::Vector2f(30, laneHeight - 30));
+                vehicleRect.setPosition(sf::Vector2f(startX + 20 + j * vehicleSpacing, y + 10));
+                
+                if (vehicles[j]->priority) {
+                    vehicleRect.setFillColor(sf::Color(255, 215, 0)); // Gold for priority
+                } else {
+                    vehicleRect.setFillColor(sf::Color(100, 150, 255)); // Blue
+                }
+                vehicleRect.setOutlineThickness(1);
+                vehicleRect.setOutlineColor(sf::Color::White);
+                window.draw(vehicleRect);
+            }
+            
+            // Queue size indicator
+            if (vehicles.size() > 20) {
+                sf::Text moreText(font);
+                moreText.setString("+" + std::to_string(vehicles.size() - 20));
+                moreText.setCharacterSize(14);
+                moreText.setFillColor(sf::Color::Yellow);
+                moreText.setPosition(sf::Vector2f(startX + 720, y + laneHeight/2 - 10));
+                window.draw(moreText);
+            }
+        }
+        
+        // Draw statistics panel
+        drawStatistics();
+        
+        // Draw title
+        sf::Text title(font);
+        title.setString("Traffic Signal Simulation");
+        title.setCharacterSize(28);
+        title.setFillColor(sf::Color::White);
+        title.setPosition(sf::Vector2f(400, 20));
+        window.draw(title);
+        
+        // Draw controls
+        sf::Text controls(font);
+        controls.setString("SPACE: Pause/Resume | R: Reset | ESC: Exit");
+        controls.setCharacterSize(14);
+        controls.setFillColor(sf::Color(200, 200, 200));
+        controls.setPosition(sf::Vector2f(350, 60));
+        window.draw(controls);
+        
+        // Draw status
+        sf::Text status(font);
+        std::string statusStr = isPaused ? "[PAUSED]" : (isRunning ? "[RUNNING]" : "[FINISHED]");
+        status.setString(statusStr);
+        status.setCharacterSize(18);
+        status.setFillColor(isPaused ? sf::Color::Yellow : (isRunning ? sf::Color::Green : sf::Color::Red));
+        status.setPosition(sf::Vector2f(550, 90));
+        window.draw(status);
+        
+        window.display();
+    }
+    
+    void drawStatistics() {
+        float panelX = 900.0f;
+        float panelY = 150.0f;
+        
+        // Background panel
+        sf::RectangleShape panel(sf::Vector2f(280, 400));
+        panel.setPosition(sf::Vector2f(panelX, panelY));
+        panel.setFillColor(sf::Color(50, 50, 50));
+        panel.setOutlineThickness(2);
+        panel.setOutlineColor(sf::Color(100, 100, 100));
+        window.draw(panel);
+        
+        // Statistics text
+        std::vector<std::string> stats;
+        stats.push_back("STATISTICS");
+        stats.push_back("");
+        stats.push_back("Time: " + std::to_string(currentTime) + " / " + std::to_string(simTime));
+        stats.push_back("");
+        stats.push_back("Green Lane: " + std::to_string(light.currentLane));
+        stats.push_back("Timer: " + std::to_string(light.timer) + " / " + std::to_string(light.greenTime));
+        stats.push_back("");
+        stats.push_back("Total Arrived: " + std::to_string(totalArrived));
+        stats.push_back("Total Passed: " + std::to_string(totalPassed));
+        
+        int remaining = 0;
+        for (int i = 0; i < lanes; ++i) remaining += roads[i].size();
+        stats.push_back("Still Waiting: " + std::to_string(remaining));
+        stats.push_back("");
+        
+        double avgWait = (totalPassed == 0) ? 0.0 : (double)totalWaitTime / totalPassed;
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << avgWait;
+        stats.push_back("Avg Wait: " + oss.str());
+        stats.push_back("");
+        stats.push_back("--- Queue Sizes ---");
+        
+        for (int i = 0; i < lanes; ++i) {
+            stats.push_back("Lane " + std::to_string(i) + ": " + std::to_string(roads[i].size()));
+        }
+        
+        float textY = panelY + 15;
+        for (const auto& line : stats) {
+            sf::Text text(font);
+            text.setString(line);
+            text.setCharacterSize(14);
+            text.setFillColor(sf::Color::White);
+            text.setPosition(sf::Vector2f(panelX + 15, textY));
+            window.draw(text);
+            textY += 20;
+        }
+        
+        // Legend
+        float legendY = panelY + 320;
+        sf::Text legendTitle(font);
+        legendTitle.setString("Legend:");
+        legendTitle.setCharacterSize(14);
+        legendTitle.setFillColor(sf::Color::White);
+        legendTitle.setPosition(sf::Vector2f(panelX + 15, legendY));
+        window.draw(legendTitle);
+        
+        // Normal vehicle
+        sf::RectangleShape normalVehicle(sf::Vector2f(20, 15));
+        normalVehicle.setPosition(sf::Vector2f(panelX + 15, legendY + 25));
+        normalVehicle.setFillColor(sf::Color(100, 150, 255));
+        window.draw(normalVehicle);
+        
+        sf::Text normalLabel(font);
+        normalLabel.setString("Normal");
+        normalLabel.setCharacterSize(12);
+        normalLabel.setFillColor(sf::Color::White);
+        normalLabel.setPosition(sf::Vector2f(panelX + 45, legendY + 25));
+        window.draw(normalLabel);
+        
+        // Priority vehicle
+        sf::RectangleShape priorityVehicle(sf::Vector2f(20, 15));
+        priorityVehicle.setPosition(sf::Vector2f(panelX + 15, legendY + 50));
+        priorityVehicle.setFillColor(sf::Color(255, 215, 0));
+        window.draw(priorityVehicle);
+        
+        sf::Text priorityLabel(font);
+        priorityLabel.setString("Priority");
+        priorityLabel.setCharacterSize(12);
+        priorityLabel.setFillColor(sf::Color::White);
+        priorityLabel.setPosition(sf::Vector2f(panelX + 45, legendY + 50));
+        window.draw(priorityLabel);
+    }
+};
+
+int main() {
+    int lanes, simTime, greenTime;
+    double arrivalProb, priorityProb;
+    float stepDelay;
+    
+    std::cout << "--- Traffic Signal Simulation Configuration ---\n";
+    std::cout << "Number of lanes (e.g., 2 or 4): "; std::cin >> lanes;
+    std::cout << "Simulation time steps (e.g., 60): "; std::cin >> simTime;
+    std::cout << "Green time per lane (time steps, e.g., 5): "; std::cin >> greenTime;
+    std::cout << "Arrival probability per lane per step (0..1, e.g., 0.5): "; std::cin >> arrivalProb;
+    std::cout << "Priority vehicle probability per arrival (0..1, e.g., 0.01): "; std::cin >> priorityProb;
+    std::cout << "Step delay in seconds (e.g., 0.5): "; std::cin >> stepDelay;
+    
+    std::cout << "\nStarting GUI simulation...\n";
+    std::cout << "Controls:\n";
+    std::cout << "  SPACE - Pause/Resume\n";
+    std::cout << "  R - Reset simulation\n";
+    std::cout << "  ESC - Exit\n\n";
+    
+    SimulationGUI sim(lanes, simTime, greenTime, arrivalProb, priorityProb, stepDelay);
+    sim.run();
+    
+    return 0;
+}
+
+/* 
+Compilation instructions for SFML 3.0:
+g++ -std=c++20 main.cpp -o traffic_sim -lsfml-graphics -lsfml-window -lsfml-system
+
+g++ -std=c++20 main.cpp -o traffic_sim -I"C:\SFML-3.0.0\include" -L"C:\SFML-3.0.0\lib" -lsfml-graphics -lsfml-window -lsfml-system -static-libgcc -static-libstdc++
+SFML 3.0 requires C++20 or later!
+Make sure fonts/calibri-regular.ttf exists in your project folder.B
+*/
